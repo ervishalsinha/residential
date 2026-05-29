@@ -1,0 +1,14 @@
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+sqlalchemy==2.0.44
+alembic==1.17.1
+psycopg2-binary==2.9.12
+pydantic==2.13.4
+pydantic-settings==2.11.0
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-multipart==0.0.20
+slowapi==0.1.9
+python-socketio==5.12.1
+firebase-admin==7.1.0
