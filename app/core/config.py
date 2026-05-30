@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
     environment: str = "development"
 
-    database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/residential_platform"
+    database_url: str = "postgresql+psycopg2://neondb_owner:npg_XVGJApR0j1ri@ep-morning-hill-ap0yej38-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
     auto_create_tables: bool = False
 
     jwt_secret_key: str = "change-me-in-production"
@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     tenant_app_android_url: str = "https://play.google.com/store/apps/details?id=com.example.easystay"
     tenant_app_ios_url: str = "https://apps.apple.com/app/example-easy-stay/id1234567890"
 
-    cors_origins: str = "http://localhost:3000,http://localhost:5173,http://localhost:8081"
+    cors_origins: str = "*"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
