@@ -162,6 +162,21 @@ class RazorpayVerifyRequest(BaseModel):
     razorpay_signature: str
 
 
+class DirectTransferSubmitRequest(BaseModel):
+    utr_reference: str
+    proof_image_url: str | None = None
+
+
+class DirectTransferProofUploadRequest(BaseModel):
+    image_base64: str
+    mime_type: str | None = None
+
+
+class DirectTransferReviewRequest(BaseModel):
+    decision: str
+    note: str | None = None
+
+
 class StaffCreate(BaseModel):
     property_id: UUID
     full_name: str

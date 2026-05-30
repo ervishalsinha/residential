@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     razorpay_enabled: bool = False
     razorpay_key_id: str | None = None
     razorpay_key_secret: str | None = None
+    razorpay_webhook_secret: str | None = None
 
     cors_origins: str = "*"
 

@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
@@ -9,6 +12,8 @@ from app.db.session import engine
 from app.models import Base
 
 settings = get_settings()
+uploads_dir = Path(__file__).resolve().parent.parent / "uploads"
+uploads_dir.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 
@@ -22,6 +27,7 @@ app.add_middleware(
 
 app.include_router(api_router, prefix="/api/v1")
 app.mount("/socket.io", socket_app)
+app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
 
 
 @app.on_event("startup")

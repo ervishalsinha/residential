@@ -1,13 +1,17 @@
 import json
 import hmac
 import hashlib
+import base64
+import binascii
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from urllib import error as url_error
 from urllib import request as url_request
+from uuid import uuid4
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from sqlalchemy import case, extract, func
 from sqlalchemy.orm import Session
 
@@ -17,9 +21,18 @@ from app.core.socket_server import emit_event
 from app.db.session import get_db
 from app.models import Notice, Notification, OwnerExpense, Payment, Property, PropertyType, ResidentProfile, Unit, User
 from app.repositories.domain import payments_repo
-from app.schemas.domain import PaymentCreate, PaymentUpdate, RazorpayVerifyRequest
+from app.schemas.domain import (
+    DirectTransferProofUploadRequest,
+    DirectTransferReviewRequest,
+    DirectTransferSubmitRequest,
+    PaymentCreate,
+    PaymentUpdate,
+    RazorpayVerifyRequest,
+)
 
 router = APIRouter()
+proof_upload_dir = Path(__file__).resolve().parents[4] / "uploads" / "payment-proofs"
+proof_upload_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _razorpay_headers(key_id: str, key_secret: str) -> dict[str, str]:
@@ -56,6 +69,11 @@ def _razorpay_request(method: str, path: str, key_id: str, key_secret: str, payl
 def _verify_razorpay_signature(order_id: str, payment_id: str, signature: str, key_secret: str) -> bool:
     message = f"{order_id}|{payment_id}".encode("utf-8")
     digest = hmac.new(key_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, signature)
+
+
+def _verify_razorpay_webhook_signature(payload_bytes: bytes, signature: str, webhook_secret: str) -> bool:
+    digest = hmac.new(webhook_secret.encode("utf-8"), payload_bytes, hashlib.sha256).hexdigest()
     return hmac.compare_digest(digest, signature)
 
 
@@ -295,24 +313,24 @@ def _resolve_owner_payment_destination(
     db: Session,
     resident_profile: ResidentProfile,
     property_row: Property,
-) -> tuple[str | None, str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
     owner_user_id = str(resident_profile.owner_user_id) if resident_profile.owner_user_id else None
     if not owner_user_id and property_row.owner_user_id:
         owner_user_id = str(property_row.owner_user_id)
     if not owner_user_id:
-        return None, None, None
+        return None, None, None, None, None
 
     owner = db.query(User).filter(User.id == owner_user_id).first()
     if not owner:
-        return None, None, None
+        return None, None, None, None, None
 
     active_method = (owner.active_payment_method or "").strip().lower() or None
     if active_method == "upi" and owner.payment_upi_id:
-        return active_method, owner.payment_upi_id, owner_user_id
+        return active_method, owner.payment_upi_id, owner_user_id, owner.razorpay_linked_account_id, owner.razorpay_linked_account_status
     if active_method == "bank" and owner.payment_bank_account_number and owner.payment_bank_ifsc:
         destination = f"{owner.payment_bank_account_number}|{owner.payment_bank_ifsc}"
-        return active_method, destination, owner_user_id
-    return active_method, None, owner_user_id
+        return active_method, destination, owner_user_id, owner.razorpay_linked_account_id, owner.razorpay_linked_account_status
+    return active_method, None, owner_user_id, owner.razorpay_linked_account_id, owner.razorpay_linked_account_status
 
 
 def _owner_destination_display(method: str | None, destination: str | None) -> str | None:
@@ -575,8 +593,16 @@ def tenant_due_breakdown(
     if not property_row:
         raise HTTPException(status_code=404, detail="Property not found")
 
-    owner_method, owner_destination, _owner_user_id = _resolve_owner_payment_destination(db, resident_profile, property_row)
+    owner_method, owner_destination, _owner_user_id, owner_linked_account_id, owner_linked_account_status = _resolve_owner_payment_destination(db, resident_profile, property_row)
     owner_destination_display = _owner_destination_display(owner_method, owner_destination)
+    owner_name: str | None = None
+    owner_mobile: str | None = resident_profile.owner_mobile
+    owner_user_id = str(resident_profile.owner_user_id) if resident_profile.owner_user_id else (str(property_row.owner_user_id) if property_row.owner_user_id else None)
+    if owner_user_id:
+        owner_user = db.query(User).filter(User.id == owner_user_id).first()
+        if owner_user:
+            owner_name = owner_user.full_name
+            owner_mobile = owner_mobile or owner_user.mobile_number
     property_type_name = (
         db.query(PropertyType.name)
         .join(Property, Property.property_type_id == PropertyType.id)
@@ -626,6 +652,16 @@ def tenant_due_breakdown(
             "breakdown": _resident_charge_breakdown(resident_profile),
             "owner_active_payment_method": owner_method,
             "owner_payment_destination": owner_destination_display,
+            "owner_razorpay_linked_account_id": owner_linked_account_id,
+            "owner_razorpay_linked_account_status": owner_linked_account_status,
+            "owner_name": owner_name,
+            "owner_mobile": owner_mobile,
+            "manual_payment_utr": item.manual_payment_utr,
+            "manual_payment_proof_url": item.manual_payment_proof_url,
+            "manual_payment_submitted_at": item.manual_payment_submitted_at,
+            "manual_review_status": item.manual_review_status,
+            "manual_review_note": item.manual_review_note,
+            "manual_reviewed_at": item.manual_reviewed_at,
             "amount_editable": False,
         }
 
@@ -789,6 +825,11 @@ def update_payment(
             raise HTTPException(status_code=403, detail="Residents can only mark payment status")
         if payload.status != "paid":
             raise HTTPException(status_code=403, detail="Residents can only mark due cycle as paid")
+        if payload.gateway_channel != "razorpay":
+            raise HTTPException(
+                status_code=403,
+                detail="Residents cannot directly mark paid for manual transfer. Submit payment proof for owner approval.",
+            )
     elif role_name not in {"property_admin", "super_admin"}:
         raise HTTPException(status_code=403, detail="Role not permitted")
 
@@ -803,28 +844,34 @@ def update_payment(
     previous_status = str(item.status)
 
     if data.get("status") == "paid":
-        resident_profile = (
-            db.query(ResidentProfile)
-            .filter(
-                ResidentProfile.user_id == str(item.resident_id),
-                ResidentProfile.property_id == str(item.property_id),
-                ResidentProfile.occupancy_status != "deleted",
+        # If payout destination was snapshotted at order creation, reuse it to prevent drift
+        # when owner changes active method between order creation and payment verification.
+        if item.payout_method in {"upi", "bank"} and item.payout_destination:
+            data["payout_method"] = item.payout_method
+            data["payout_destination"] = item.payout_destination
+        else:
+            resident_profile = (
+                db.query(ResidentProfile)
+                .filter(
+                    ResidentProfile.user_id == str(item.resident_id),
+                    ResidentProfile.property_id == str(item.property_id),
+                    ResidentProfile.occupancy_status != "deleted",
+                )
+                .order_by(ResidentProfile.updated_at.desc())
+                .first()
             )
-            .order_by(ResidentProfile.updated_at.desc())
-            .first()
-        )
-        property_row = db.query(Property).filter(Property.id == str(item.property_id)).first()
-        if not resident_profile or not property_row:
-            raise HTTPException(status_code=400, detail="Resident/property mapping not found for this payment")
+            property_row = db.query(Property).filter(Property.id == str(item.property_id)).first()
+            if not resident_profile or not property_row:
+                raise HTTPException(status_code=400, detail="Resident/property mapping not found for this payment")
 
-        payout_method, payout_destination, _owner_user_id = _resolve_owner_payment_destination(db, resident_profile, property_row)
-        if payout_method not in {"upi", "bank"} or not payout_destination:
-            raise HTTPException(
-                status_code=400,
-                detail="Owner payment destination is not configured. Please ask owner to update Payment Settings.",
-            )
-        data["payout_method"] = payout_method
-        data["payout_destination"] = payout_destination
+            payout_method, payout_destination, _owner_user_id, _owner_linked_account_id, _owner_linked_account_status = _resolve_owner_payment_destination(db, resident_profile, property_row)
+            if payout_method not in {"upi", "bank"} or not payout_destination:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Owner payment destination is not configured. Please ask owner to update Payment Settings.",
+                )
+            data["payout_method"] = payout_method
+            data["payout_destination"] = payout_destination
         data["paid_at"] = datetime.utcnow()
     elif "status" in data and data.get("status") != "paid":
         data["paid_at"] = None
@@ -877,6 +924,252 @@ def update_payment(
     return updated
 
 
+@router.post("/{payment_id}/direct-transfer/submit")
+def submit_direct_transfer_payment(
+    payment_id: UUID,
+    payload: DirectTransferSubmitRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    item = payments_repo.get(db, payment_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    ensure_property_access(db, user, str(item.property_id))
+    role_name = get_role_name(user)
+    if role_name != "resident":
+        raise HTTPException(status_code=403, detail="Only residents can submit transfer proof")
+    if str(item.resident_id) != str(user.id):
+        raise HTTPException(status_code=403, detail="Residents can only submit proof for their own payments")
+    if str(item.status).lower() == "paid":
+        raise HTTPException(status_code=400, detail="Payment already marked as paid")
+
+    resident_profile = (
+        db.query(ResidentProfile)
+        .filter(
+            ResidentProfile.user_id == str(item.resident_id),
+            ResidentProfile.property_id == str(item.property_id),
+            ResidentProfile.occupancy_status != "deleted",
+        )
+        .order_by(ResidentProfile.updated_at.desc())
+        .first()
+    )
+    property_row = db.query(Property).filter(Property.id == str(item.property_id)).first()
+    if not resident_profile or not property_row:
+        raise HTTPException(status_code=400, detail="Resident/property mapping not found for this payment")
+
+    payout_method, payout_destination, _owner_user_id, _owner_linked_account_id, _owner_linked_account_status = _resolve_owner_payment_destination(
+        db, resident_profile, property_row
+    )
+    if payout_method not in {"upi", "bank"} or not payout_destination:
+        raise HTTPException(status_code=400, detail="Owner has not added payment details")
+
+    item.gateway_channel = "manual_direct_transfer"
+    item.manual_payment_utr = payload.utr_reference.strip()
+    item.manual_payment_proof_url = (payload.proof_image_url or "").strip() or None
+    item.manual_payment_submitted_at = datetime.utcnow()
+    item.manual_review_status = "submitted"
+    item.manual_review_note = None
+    item.manual_reviewed_at = None
+    item.manual_reviewed_by = None
+    db.commit()
+    db.refresh(item)
+
+    owner_user_ids = _property_owner_user_ids(db, str(item.property_id))
+    for owner_user_id in owner_user_ids:
+        if owner_user_id == str(item.resident_id):
+            continue
+        db.add(
+            Notification(
+                user_id=owner_user_id,
+                notification_type="payment_proof_submitted",
+                title="Payment proof submitted",
+                body=f"Resident submitted transfer proof (UTR {item.manual_payment_utr}) for INR {float(item.amount):,.2f}.",
+                metadata_json=json.dumps({"payment_id": str(item.id)}),
+                channel="push",
+                status="queued",
+                is_read=False,
+            )
+        )
+    db.commit()
+
+    return {"message": "Payment proof submitted for owner approval", "payment_id": str(item.id), "manual_review_status": item.manual_review_status}
+
+
+@router.post("/direct-transfer/proofs/upload")
+def upload_direct_transfer_proof(
+    payload: DirectTransferProofUploadRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    del user
+    raw_base64 = (payload.image_base64 or "").strip()
+    if not raw_base64:
+        raise HTTPException(status_code=400, detail="image_base64 is required")
+
+    if "," in raw_base64 and raw_base64.lower().startswith("data:"):
+        raw_base64 = raw_base64.split(",", 1)[1]
+
+    try:
+        image_bytes = base64.b64decode(raw_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid base64 image payload")
+
+    if len(image_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large. Max 5MB allowed")
+
+    mime_type = (payload.mime_type or "image/jpeg").strip().lower()
+    extension = ".jpg"
+    if mime_type in {"image/png", "png"}:
+        extension = ".png"
+    elif mime_type in {"image/webp", "webp"}:
+        extension = ".webp"
+
+    file_name = f"proof_{uuid4().hex}{extension}"
+    file_path = proof_upload_dir / file_name
+    file_path.write_bytes(image_bytes)
+
+    proof_url = str(request.base_url).rstrip("/") + f"/uploads/payment-proofs/{file_name}"
+    return {"proof_image_url": proof_url}
+
+
+@router.post("/{payment_id}/direct-transfer/review")
+def review_direct_transfer_payment(
+    payment_id: UUID,
+    payload: DirectTransferReviewRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    item = payments_repo.get(db, payment_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    ensure_property_access(db, user, str(item.property_id), owner_only=True)
+
+    decision = (payload.decision or "").strip().lower()
+    if decision not in {"approve", "reject"}:
+        raise HTTPException(status_code=400, detail="decision must be approve or reject")
+    if item.manual_review_status != "submitted":
+        raise HTTPException(status_code=400, detail="No pending transfer proof to review")
+
+    item.manual_reviewed_by = str(user.id)
+    item.manual_reviewed_at = datetime.utcnow()
+    item.manual_review_note = (payload.note or "").strip() or None
+
+    if decision == "approve":
+        item.manual_review_status = "approved"
+        db.commit()
+        db.refresh(item)
+        updated = update_payment(
+            payment_id=payment_id,
+            payload=PaymentUpdate(status="paid", gateway_channel="manual_direct_transfer"),
+            background_tasks=background_tasks,
+            db=db,
+            current_user=user,
+        )
+        return {
+            "message": "Payment proof approved and cycle marked as paid",
+            "payment_id": str(updated.id),
+            "status": str(updated.status),
+            "manual_review_status": "approved",
+        }
+
+    item.manual_review_status = "rejected"
+    item.status = "pending"
+    item.paid_at = None
+    item.gateway_channel = "manual_direct_transfer"
+    db.commit()
+    db.refresh(item)
+
+    db.add(
+        Notification(
+            user_id=str(item.resident_id),
+            notification_type="payment_proof_rejected",
+            title="Payment proof rejected",
+            body="Owner rejected your payment proof. Please submit a valid UTR/screenshot.",
+            metadata_json=json.dumps({"payment_id": str(item.id), "note": item.manual_review_note}),
+            channel="push",
+            status="queued",
+            is_read=False,
+        )
+    )
+    db.commit()
+    return {
+        "message": "Payment proof rejected",
+        "payment_id": str(item.id),
+        "status": str(item.status),
+        "manual_review_status": item.manual_review_status,
+    }
+
+
+@router.post("/razorpay/webhook")
+async def razorpay_webhook(
+    request: Request,
+    x_razorpay_signature: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    settings = get_settings()
+    if not settings.razorpay_enabled or not settings.razorpay_key_secret:
+        raise HTTPException(status_code=400, detail="Razorpay is not configured")
+    if not settings.razorpay_webhook_secret:
+        raise HTTPException(status_code=400, detail="Razorpay webhook secret is not configured")
+    if not x_razorpay_signature:
+        raise HTTPException(status_code=400, detail="Missing webhook signature")
+
+    payload_bytes = await request.body()
+    if not _verify_razorpay_webhook_signature(payload_bytes, x_razorpay_signature, settings.razorpay_webhook_secret):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    try:
+        event_payload = json.loads(payload_bytes.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid webhook payload")
+
+    event_type = str(event_payload.get("event") or "").strip().lower()
+    payload_obj = event_payload.get("payload") or {}
+    transfer_entity = ((payload_obj.get("transfer") or {}).get("entity") or {})
+    payment_entity = ((payload_obj.get("payment") or {}).get("entity") or {})
+    order_entity = ((payload_obj.get("order") or {}).get("entity") or {})
+
+    transfer_notes = transfer_entity.get("notes") or {}
+    payment_notes = payment_entity.get("notes") or {}
+    payment_id_from_notes = transfer_notes.get("payment_id") or payment_notes.get("payment_id") or order_entity.get("receipt")
+
+    if not payment_id_from_notes:
+        return {"received": True, "ignored": True, "reason": "payment_id missing in webhook payload"}
+
+    item = db.query(Payment).filter(Payment.id == str(payment_id_from_notes)).first()
+    if not item:
+        return {"received": True, "ignored": True, "reason": "payment not found"}
+
+    if payment_entity:
+        item.razorpay_payment_id = payment_entity.get("id") or item.razorpay_payment_id
+        item.razorpay_order_id = payment_entity.get("order_id") or item.razorpay_order_id
+    if order_entity and not item.razorpay_order_id:
+        item.razorpay_order_id = order_entity.get("id")
+
+    if transfer_entity:
+        item.razorpay_transfer_id = transfer_entity.get("id") or item.razorpay_transfer_id
+        item.razorpay_transfer_status = transfer_entity.get("status") or item.razorpay_transfer_status
+        item.transfer_updated_at = datetime.utcnow()
+
+    if event_type in {"transfer.processed", "payment.captured"} and str(item.status).lower() != "paid":
+        item.status = "paid"
+        item.gateway_channel = "razorpay"
+        item.paid_at = item.paid_at or datetime.utcnow()
+    elif event_type in {"transfer.failed", "payment.failed"}:
+        item.status = "failed"
+        item.gateway_channel = "razorpay"
+
+    db.commit()
+    return {
+        "received": True,
+        "event": event_type,
+        "payment_id": str(item.id),
+        "transfer_id": item.razorpay_transfer_id,
+        "transfer_status": item.razorpay_transfer_status,
+    }
+
+
 @router.post("/{payment_id}/razorpay/order")
 def create_razorpay_order(
     payment_id: UUID,
@@ -910,9 +1203,26 @@ def create_razorpay_order(
     if not resident_profile or not property_row:
         raise HTTPException(status_code=400, detail="Resident/property mapping not found for this payment")
 
-    payout_method, payout_destination, _owner_user_id = _resolve_owner_payment_destination(db, resident_profile, property_row)
+    payout_method, payout_destination, owner_user_id, owner_linked_account_id, owner_linked_account_status = _resolve_owner_payment_destination(db, resident_profile, property_row)
     if payout_method not in {"upi", "bank"} or not payout_destination:
         raise HTTPException(status_code=400, detail="Owner has not added payment details")
+    if not owner_linked_account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Owner Razorpay linked account is not configured. Please ask owner to complete payouts onboarding.",
+        )
+    if str(owner_linked_account_status or "").strip().lower() not in {"activated", "verified"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Owner payouts KYC is not completed yet. Payment is blocked until owner linked account is verified.",
+        )
+
+    # Snapshot owner active destination at initiation time; this is the destination
+    # resident confirms they are paying to for this specific cycle.
+    item.payout_method = payout_method
+    item.payout_destination = payout_destination
+    db.commit()
+    db.refresh(item)
 
     amount_paise = int(round(float(item.amount) * 100))
     order_payload = {
@@ -923,7 +1233,22 @@ def create_razorpay_order(
             "payment_id": str(item.id),
             "resident_id": str(item.resident_id),
             "property_id": str(item.property_id),
+            "owner_user_id": owner_user_id,
+            "owner_payout_method": payout_method,
+            "owner_payout_destination": payout_destination,
         },
+        "transfers": [
+            {
+                "account": owner_linked_account_id,
+                "amount": amount_paise,
+                "currency": "INR",
+                "notes": {
+                    "payment_id": str(item.id),
+                    "owner_user_id": owner_user_id,
+                },
+                "on_hold": False,
+            }
+        ],
     }
     order = _razorpay_request(
         "POST",
@@ -932,6 +1257,10 @@ def create_razorpay_order(
         settings.razorpay_key_secret,
         payload=order_payload,
     )
+    item.razorpay_order_id = order.get("id")
+    item.gateway_channel = "razorpay"
+    db.commit()
+    db.refresh(item)
 
     return {
         "key_id": settings.razorpay_key_id,
@@ -941,6 +1270,11 @@ def create_razorpay_order(
         "name": "Easy Stay",
         "description": "Rent payment",
         "payment_id": str(item.id),
+        "owner_user_id": owner_user_id,
+        "owner_payout_method": payout_method,
+        "owner_payout_destination": _owner_destination_display(payout_method, payout_destination),
+        "owner_razorpay_linked_account_id": owner_linked_account_id,
+        "owner_razorpay_linked_account_status": owner_linked_account_status,
     }
 
 
@@ -987,6 +1321,25 @@ def verify_razorpay_payment(
         raise HTTPException(status_code=400, detail="Razorpay amount mismatch")
     if rzp_status not in {"authorized", "captured"}:
         raise HTTPException(status_code=400, detail="Razorpay payment not successful")
+
+    item.razorpay_order_id = payload.razorpay_order_id
+    item.razorpay_payment_id = payload.razorpay_payment_id
+    item.gateway_channel = "razorpay"
+
+    transfers_payload = _razorpay_request(
+        "GET",
+        f"/payments/{payload.razorpay_payment_id}/transfers",
+        settings.razorpay_key_id,
+        settings.razorpay_key_secret,
+    )
+    transfer_items = transfers_payload.get("items") if isinstance(transfers_payload, dict) else None
+    first_transfer = transfer_items[0] if isinstance(transfer_items, list) and transfer_items else None
+    if first_transfer:
+        item.razorpay_transfer_id = first_transfer.get("id")
+        item.razorpay_transfer_status = first_transfer.get("status")
+        item.transfer_updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(item)
 
     background_tasks = BackgroundTasks()
     return update_payment(

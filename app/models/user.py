@@ -26,6 +26,8 @@ class User(Base):
     payment_bank_account_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
     payment_bank_ifsc: Mapped[str | None] = mapped_column(String(20), nullable=True)
     active_payment_method: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    razorpay_linked_account_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    razorpay_linked_account_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
     role_id: Mapped[str] = mapped_column(String(36), ForeignKey("roles.id"), index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

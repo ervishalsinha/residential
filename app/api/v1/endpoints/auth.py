@@ -1,4 +1,7 @@
 import uuid
+import json
+from urllib import error as url_error
+from urllib import request as url_request
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,6 +16,8 @@ from app.schemas.auth import (
     AuthenticatedUser,
     ForgotPasswordRequest,
     LoginRequest,
+    OwnerLinkedAccountStatusResponse,
+    OwnerLinkedAccountSyncRequest,
     OTPRequest,
     OTPVerifyRequest,
     OwnerPaymentSettingsUpdate,
@@ -25,6 +30,37 @@ from app.schemas.common import APIMessage
 from app.services.otp_service import create_otp, validate_otp
 
 router = APIRouter()
+
+
+def _razorpay_headers(key_id: str, key_secret: str) -> dict[str, str]:
+    token = f"{key_id}:{key_secret}".encode("utf-8")
+    encoded = __import__("base64").b64encode(token).decode("utf-8")
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Content-Type": "application/json",
+    }
+
+
+def _razorpay_request(method: str, path: str, key_id: str, key_secret: str, payload: dict | None = None) -> dict:
+    url = f"https://api.razorpay.com/v1{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = url_request.Request(url, data=data, method=method)
+    for key, value in _razorpay_headers(key_id, key_secret).items():
+        req.add_header(key, value)
+
+    try:
+        with url_request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except url_error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8")
+            parsed = json.loads(body)
+            detail = parsed.get("error", {}).get("description") or body
+        except Exception:
+            detail = "Razorpay API request failed"
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not connect to Razorpay")
 
 
 def _normalize_mobile_number(raw_mobile_number: str) -> str:
@@ -58,12 +94,21 @@ def _normalize_upi(raw_value: str | None) -> str | None:
     return value or None
 
 
+def _normalize_razorpay_linked_account(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _owner_payment_settings_payload(user: User) -> dict:
     return {
         "payment_upi_id": user.payment_upi_id,
         "payment_bank_account_number": user.payment_bank_account_number,
         "payment_bank_ifsc": user.payment_bank_ifsc,
         "active_payment_method": user.active_payment_method,
+        "razorpay_linked_account_id": user.razorpay_linked_account_id,
+        "razorpay_linked_account_status": user.razorpay_linked_account_status,
     }
 
 
@@ -232,6 +277,8 @@ def me(user: User = Depends(get_current_user)) -> AuthenticatedUser:
         payment_bank_account_number=user.payment_bank_account_number,
         payment_bank_ifsc=user.payment_bank_ifsc,
         active_payment_method=user.active_payment_method,
+        razorpay_linked_account_id=user.razorpay_linked_account_id,
+        razorpay_linked_account_status=user.razorpay_linked_account_status,
     )
 
 
@@ -262,6 +309,11 @@ def update_owner_payment_settings(payload: OwnerPaymentSettingsUpdate, user: Use
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="active_payment_method must be 'upi' or 'bank'")
         user.active_payment_method = active_method
 
+    if payload.razorpay_linked_account_id is not None:
+        user.razorpay_linked_account_id = _normalize_razorpay_linked_account(payload.razorpay_linked_account_id)
+        if user.razorpay_linked_account_id is None:
+            user.razorpay_linked_account_status = None
+
     if user.active_payment_method == "upi" and not user.payment_upi_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="UPI ID is required when active_payment_method is 'upi'")
 
@@ -280,6 +332,97 @@ def update_owner_payment_settings(payload: OwnerPaymentSettingsUpdate, user: Use
     db.commit()
     db.refresh(user)
     return _owner_payment_settings_payload(user)
+
+
+@router.get("/payment-settings/route-account", response_model=OwnerLinkedAccountStatusResponse)
+def get_owner_route_account_status(user: User = Depends(get_current_user)):
+    role_name = user.role.name if user.role else "resident"
+    if role_name not in {"property_admin", "super_admin"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only owners can access payment settings")
+
+    linked_account_status = (user.razorpay_linked_account_status or "").strip().lower() or None
+    is_verified = bool(user.razorpay_linked_account_id) and linked_account_status in {"activated", "verified"}
+    return OwnerLinkedAccountStatusResponse(
+        razorpay_linked_account_id=user.razorpay_linked_account_id,
+        razorpay_linked_account_status=user.razorpay_linked_account_status,
+        route_linked_account_badge="verified" if is_verified else "missing",
+    )
+
+
+@router.post("/payment-settings/route-account/sync", response_model=OwnerLinkedAccountStatusResponse)
+def sync_owner_route_account(
+    payload: OwnerLinkedAccountSyncRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    role_name = user.role.name if user.role else "resident"
+    if role_name not in {"property_admin", "super_admin"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only owners can sync route accounts")
+
+    settings = get_settings()
+    if not settings.razorpay_enabled or not settings.razorpay_key_id or not settings.razorpay_key_secret:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Razorpay is not configured")
+
+    legal_business_name = (payload.legal_business_name or user.full_name or "Owner Account").strip()
+    contact_name = (payload.contact_name or user.full_name or "Owner").strip()
+    phone = _normalize_mobile_number(payload.phone or user.mobile_number)
+
+    account_payload = {
+        "email": payload.email or user.email or None,
+        "phone": phone,
+        "type": "route",
+        "reference_id": str(user.id),
+        "legal_business_name": legal_business_name,
+        "business_type": (payload.business_type or "individual").strip().lower(),
+        "contact_name": contact_name,
+        "profile": {
+            "category": (payload.profile_category or "services").strip().lower(),
+            "subcategory": (payload.profile_subcategory or "consulting").strip().lower(),
+            "addresses": {
+                "registered": {
+                    "street1": payload.street1 or "Owner Address",
+                    "street2": payload.street2 or "",
+                    "city": payload.city or "NA",
+                    "state": payload.state or "NA",
+                    "postal_code": payload.postal_code or "000000",
+                    "country": (payload.country or "IN").strip().upper(),
+                }
+            },
+        },
+    }
+
+    account_payload = {k: v for k, v in account_payload.items() if v is not None and v != ""}
+    existing_account_id = (user.razorpay_linked_account_id or "").strip() or None
+    if existing_account_id:
+        account = _razorpay_request(
+            "PATCH",
+            f"/accounts/{existing_account_id}",
+            settings.razorpay_key_id,
+            settings.razorpay_key_secret,
+            payload=account_payload,
+        )
+    else:
+        account = _razorpay_request(
+            "POST",
+            "/accounts",
+            settings.razorpay_key_id,
+            settings.razorpay_key_secret,
+            payload=account_payload,
+        )
+
+    linked_account_id = account.get("id")
+    linked_account_status = account.get("status")
+    user.razorpay_linked_account_id = linked_account_id
+    user.razorpay_linked_account_status = linked_account_status
+    db.commit()
+    db.refresh(user)
+
+    is_verified = bool(linked_account_id) and str(linked_account_status or "").strip().lower() in {"activated", "verified"}
+    return OwnerLinkedAccountStatusResponse(
+        razorpay_linked_account_id=user.razorpay_linked_account_id,
+        razorpay_linked_account_status=user.razorpay_linked_account_status,
+        route_linked_account_badge="verified" if is_verified else "missing",
+    )
 
 
 @router.post("/forgot-password/request", response_model=APIMessage)

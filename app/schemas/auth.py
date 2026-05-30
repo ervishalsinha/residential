@@ -54,6 +54,8 @@ class AuthenticatedUser(BaseModel):
     payment_bank_account_number: str | None = None
     payment_bank_ifsc: str | None = None
     active_payment_method: str | None = None
+    razorpay_linked_account_id: str | None = None
+    razorpay_linked_account_status: str | None = None
 
 
 class OwnerPaymentSettingsUpdate(BaseModel):
@@ -61,3 +63,26 @@ class OwnerPaymentSettingsUpdate(BaseModel):
     payment_bank_account_number: str | None = None
     payment_bank_ifsc: str | None = None
     active_payment_method: str | None = None
+    razorpay_linked_account_id: str | None = None
+
+
+class OwnerLinkedAccountSyncRequest(BaseModel):
+    legal_business_name: str | None = None
+    business_type: str = "individual"
+    contact_name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    profile_category: str = "services"
+    profile_subcategory: str = "consulting"
+    street1: str | None = None
+    street2: str | None = None
+    city: str | None = None
+    state: str | None = None
+    postal_code: str | None = None
+    country: str = "IN"
+
+
+class OwnerLinkedAccountStatusResponse(BaseModel):
+    razorpay_linked_account_id: str | None = None
+    razorpay_linked_account_status: str | None = None
+    route_linked_account_badge: str
