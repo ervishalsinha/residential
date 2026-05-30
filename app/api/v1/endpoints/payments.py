@@ -242,6 +242,50 @@ def _property_owner_user_ids(db: Session, property_id: str) -> set[str]:
     return {value for value in notice_owner_ids.union(expense_owner_ids) if value}
 
 
+def _mask_account_number(account_number: str | None) -> str:
+    value = (account_number or "").strip()
+    if len(value) <= 4:
+        return value
+    return f"{'*' * (len(value) - 4)}{value[-4:]}"
+
+
+def _resolve_owner_payment_destination(
+    db: Session,
+    resident_profile: ResidentProfile,
+    property_row: Property,
+) -> tuple[str | None, str | None, str | None]:
+    owner_user_id = str(resident_profile.owner_user_id) if resident_profile.owner_user_id else None
+    if not owner_user_id and property_row.owner_user_id:
+        owner_user_id = str(property_row.owner_user_id)
+    if not owner_user_id:
+        return None, None, None
+
+    owner = db.query(User).filter(User.id == owner_user_id).first()
+    if not owner:
+        return None, None, None
+
+    active_method = (owner.active_payment_method or "").strip().lower() or None
+    if active_method == "upi" and owner.payment_upi_id:
+        return active_method, owner.payment_upi_id, owner_user_id
+    if active_method == "bank" and owner.payment_bank_account_number and owner.payment_bank_ifsc:
+        destination = f"{owner.payment_bank_account_number}|{owner.payment_bank_ifsc}"
+        return active_method, destination, owner_user_id
+    return active_method, None, owner_user_id
+
+
+def _owner_destination_display(method: str | None, destination: str | None) -> str | None:
+    if not method or not destination:
+        return None
+    if method == "upi":
+        return destination
+    if method == "bank":
+        parts = destination.split("|", 1)
+        account_number = parts[0] if parts else ""
+        ifsc = parts[1] if len(parts) > 1 else ""
+        return f"A/C {_mask_account_number(account_number)} • IFSC {ifsc}"
+    return None
+
+
 @router.get("")
 def list_payments(
     skip: int = 0,
@@ -485,6 +529,12 @@ def tenant_due_breakdown(
     if not resident_profile:
         raise HTTPException(status_code=404, detail="Resident profile not found")
     ensure_property_access(db, current_user, str(resident_profile.property_id))
+    property_row = db.query(Property).filter(Property.id == str(resident_profile.property_id)).first()
+    if not property_row:
+        raise HTTPException(status_code=404, detail="Property not found")
+
+    owner_method, owner_destination, _owner_user_id = _resolve_owner_payment_destination(db, resident_profile, property_row)
+    owner_destination_display = _owner_destination_display(owner_method, owner_destination)
     property_type_name = (
         db.query(PropertyType.name)
         .join(Property, Property.property_type_id == PropertyType.id)
@@ -532,6 +582,9 @@ def tenant_due_breakdown(
             "paid_at": item.paid_at,
             "status": _cycle_status(item, now),
             "breakdown": _resident_charge_breakdown(resident_profile),
+            "owner_active_payment_method": owner_method,
+            "owner_payment_destination": owner_destination_display,
+            "amount_editable": False,
         }
 
         if month_payload["status"] == "paid":
@@ -686,7 +739,7 @@ def update_payment(
     if role_name == "resident":
         if str(item.resident_id) != str(current_user.id):
             raise HTTPException(status_code=403, detail="Residents can only update their own payments")
-        allowed_resident_fields = {"status"}
+        allowed_resident_fields = {"status", "gateway_channel"}
         requested_fields = set(payload.model_dump(exclude_none=True).keys())
         if not requested_fields:
             raise HTTPException(status_code=400, detail="No payment fields provided")
@@ -708,6 +761,28 @@ def update_payment(
     previous_status = str(item.status)
 
     if data.get("status") == "paid":
+        resident_profile = (
+            db.query(ResidentProfile)
+            .filter(
+                ResidentProfile.user_id == str(item.resident_id),
+                ResidentProfile.property_id == str(item.property_id),
+                ResidentProfile.occupancy_status != "deleted",
+            )
+            .order_by(ResidentProfile.updated_at.desc())
+            .first()
+        )
+        property_row = db.query(Property).filter(Property.id == str(item.property_id)).first()
+        if not resident_profile or not property_row:
+            raise HTTPException(status_code=400, detail="Resident/property mapping not found for this payment")
+
+        payout_method, payout_destination, _owner_user_id = _resolve_owner_payment_destination(db, resident_profile, property_row)
+        if payout_method not in {"upi", "bank"} or not payout_destination:
+            raise HTTPException(
+                status_code=400,
+                detail="Owner payment destination is not configured. Please ask owner to update Payment Settings.",
+            )
+        data["payout_method"] = payout_method
+        data["payout_destination"] = payout_destination
         data["paid_at"] = datetime.utcnow()
     elif "status" in data and data.get("status") != "paid":
         data["paid_at"] = None

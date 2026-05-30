@@ -153,6 +153,7 @@ class PaymentUpdate(BaseModel):
     due_date: datetime | None = None
     rent_year: int | None = None
     rent_month: int | None = None
+    gateway_channel: str | None = None
 
 
 class StaffCreate(BaseModel):

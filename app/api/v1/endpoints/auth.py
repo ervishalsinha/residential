@@ -15,6 +15,7 @@ from app.schemas.auth import (
     LoginRequest,
     OTPRequest,
     OTPVerifyRequest,
+    OwnerPaymentSettingsUpdate,
     RefreshTokenRequest,
     RegisterRequest,
     ResetPasswordRequest,
@@ -34,6 +35,36 @@ def _normalize_role_name(raw_role_name: str | None) -> str:
     if not raw_role_name:
         return "resident"
     return raw_role_name.strip().lower()
+
+
+def _normalize_account_number(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+    value = raw_value.strip().replace(" ", "")
+    return value or None
+
+
+def _normalize_ifsc(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+    value = raw_value.strip().upper().replace(" ", "")
+    return value or None
+
+
+def _normalize_upi(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+    value = raw_value.strip().lower()
+    return value or None
+
+
+def _owner_payment_settings_payload(user: User) -> dict:
+    return {
+        "payment_upi_id": user.payment_upi_id,
+        "payment_bank_account_number": user.payment_bank_account_number,
+        "payment_bank_ifsc": user.payment_bank_ifsc,
+        "active_payment_method": user.active_payment_method,
+    }
 
 
 @router.post("/register", response_model=APIMessage)
@@ -192,7 +223,63 @@ def logout(user: User = Depends(get_current_user), db: Session = Depends(get_db)
 @router.get("/me", response_model=AuthenticatedUser)
 def me(user: User = Depends(get_current_user)) -> AuthenticatedUser:
     role_name = user.role.name if user.role else "resident"
-    return AuthenticatedUser(id=str(user.id), full_name=user.full_name, mobile_number=user.mobile_number, role=role_name)
+    return AuthenticatedUser(
+        id=str(user.id),
+        full_name=user.full_name,
+        mobile_number=user.mobile_number,
+        role=role_name,
+        payment_upi_id=user.payment_upi_id,
+        payment_bank_account_number=user.payment_bank_account_number,
+        payment_bank_ifsc=user.payment_bank_ifsc,
+        active_payment_method=user.active_payment_method,
+    )
+
+
+@router.get("/payment-settings")
+def get_owner_payment_settings(user: User = Depends(get_current_user)):
+    role_name = user.role.name if user.role else "resident"
+    if role_name not in {"property_admin", "super_admin"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only owners can access payment settings")
+    return _owner_payment_settings_payload(user)
+
+
+@router.put("/payment-settings")
+def update_owner_payment_settings(payload: OwnerPaymentSettingsUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    role_name = user.role.name if user.role else "resident"
+    if role_name not in {"property_admin", "super_admin"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only owners can update payment settings")
+
+    if payload.payment_upi_id is not None:
+        user.payment_upi_id = _normalize_upi(payload.payment_upi_id)
+    if payload.payment_bank_account_number is not None:
+        user.payment_bank_account_number = _normalize_account_number(payload.payment_bank_account_number)
+    if payload.payment_bank_ifsc is not None:
+        user.payment_bank_ifsc = _normalize_ifsc(payload.payment_bank_ifsc)
+
+    if payload.active_payment_method is not None:
+        active_method = (payload.active_payment_method or "").strip().lower()
+        if active_method not in {"upi", "bank"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="active_payment_method must be 'upi' or 'bank'")
+        user.active_payment_method = active_method
+
+    if user.active_payment_method == "upi" and not user.payment_upi_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="UPI ID is required when active_payment_method is 'upi'")
+
+    if user.active_payment_method == "bank" and (not user.payment_bank_account_number or not user.payment_bank_ifsc):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bank account number and IFSC are required when active_payment_method is 'bank'",
+        )
+
+    if user.active_payment_method is None:
+        if user.payment_upi_id:
+            user.active_payment_method = "upi"
+        elif user.payment_bank_account_number and user.payment_bank_ifsc:
+            user.active_payment_method = "bank"
+
+    db.commit()
+    db.refresh(user)
+    return _owner_payment_settings_payload(user)
 
 
 @router.post("/forgot-password/request", response_model=APIMessage)

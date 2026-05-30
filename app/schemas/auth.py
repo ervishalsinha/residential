@@ -50,3 +50,14 @@ class AuthenticatedUser(BaseModel):
     full_name: str
     mobile_number: str
     role: str
+    payment_upi_id: str | None = None
+    payment_bank_account_number: str | None = None
+    payment_bank_ifsc: str | None = None
+    active_payment_method: str | None = None
+
+
+class OwnerPaymentSettingsUpdate(BaseModel):
+    payment_upi_id: str | None = None
+    payment_bank_account_number: str | None = None
+    payment_bank_ifsc: str | None = None
+    active_payment_method: str | None = None

@@ -26,5 +26,8 @@ class Payment(Base):
     due_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     rent_year: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     rent_month: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    payout_method: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    payout_destination: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    gateway_channel: Mapped[str | None] = mapped_column(String(30), nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
