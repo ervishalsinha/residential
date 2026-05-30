@@ -156,6 +156,12 @@ class PaymentUpdate(BaseModel):
     gateway_channel: str | None = None
 
 
+class RazorpayVerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
 class StaffCreate(BaseModel):
     property_id: UUID
     full_name: str

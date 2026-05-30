@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     tenant_app_android_url: str = "https://play.google.com/store/apps/details?id=com.example.easystay"
     tenant_app_ios_url: str = "https://apps.apple.com/app/example-easy-stay/id1234567890"
 
+    razorpay_enabled: bool = False
+    razorpay_key_id: str | None = None
+    razorpay_key_secret: str | None = None
+
     cors_origins: str = "*"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)

@@ -1,6 +1,10 @@
 import json
+import hmac
+import hashlib
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
+from urllib import error as url_error
+from urllib import request as url_request
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -8,13 +12,51 @@ from sqlalchemy import case, extract, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import ensure_property_access, get_current_user, get_role_name, owned_property_ids, resident_property_ids
+from app.core.config import get_settings
 from app.core.socket_server import emit_event
 from app.db.session import get_db
 from app.models import Notice, Notification, OwnerExpense, Payment, Property, PropertyType, ResidentProfile, Unit, User
 from app.repositories.domain import payments_repo
-from app.schemas.domain import PaymentCreate, PaymentUpdate
+from app.schemas.domain import PaymentCreate, PaymentUpdate, RazorpayVerifyRequest
 
 router = APIRouter()
+
+
+def _razorpay_headers(key_id: str, key_secret: str) -> dict[str, str]:
+    token = f"{key_id}:{key_secret}".encode("utf-8")
+    encoded = __import__("base64").b64encode(token).decode("utf-8")
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Content-Type": "application/json",
+    }
+
+
+def _razorpay_request(method: str, path: str, key_id: str, key_secret: str, payload: dict | None = None) -> dict:
+    url = f"https://api.razorpay.com/v1{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = url_request.Request(url, data=data, method=method)
+    for key, value in _razorpay_headers(key_id, key_secret).items():
+        req.add_header(key, value)
+
+    try:
+        with url_request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except url_error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8")
+            parsed = json.loads(body)
+            detail = parsed.get("error", {}).get("description") or body
+        except Exception:
+            detail = "Razorpay API request failed"
+        raise HTTPException(status_code=400, detail=detail)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not connect to Razorpay")
+
+
+def _verify_razorpay_signature(order_id: str, payment_id: str, signature: str, key_secret: str) -> bool:
+    message = f"{order_id}|{payment_id}".encode("utf-8")
+    digest = hmac.new(key_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, signature)
 
 
 def _resident_charge_breakdown(resident: ResidentProfile) -> dict[str, float]:
@@ -833,6 +875,127 @@ def update_payment(
         {"id": str(updated.id), "status": updated.status.value if hasattr(updated.status, "value") else str(updated.status)},
     )
     return updated
+
+
+@router.post("/{payment_id}/razorpay/order")
+def create_razorpay_order(
+    payment_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    settings = get_settings()
+    if not settings.razorpay_enabled or not settings.razorpay_key_id or not settings.razorpay_key_secret:
+        raise HTTPException(status_code=400, detail="Razorpay is not configured")
+
+    item = payments_repo.get(db, payment_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    ensure_property_access(db, user, str(item.property_id))
+    if get_role_name(user) == "resident" and str(item.resident_id) != str(user.id):
+        raise HTTPException(status_code=403, detail="Residents can only pay their own dues")
+    if str(item.status).lower() == "paid":
+        raise HTTPException(status_code=400, detail="Payment already marked as paid")
+
+    resident_profile = (
+        db.query(ResidentProfile)
+        .filter(
+            ResidentProfile.user_id == str(item.resident_id),
+            ResidentProfile.property_id == str(item.property_id),
+            ResidentProfile.occupancy_status != "deleted",
+        )
+        .order_by(ResidentProfile.updated_at.desc())
+        .first()
+    )
+    property_row = db.query(Property).filter(Property.id == str(item.property_id)).first()
+    if not resident_profile or not property_row:
+        raise HTTPException(status_code=400, detail="Resident/property mapping not found for this payment")
+
+    payout_method, payout_destination, _owner_user_id = _resolve_owner_payment_destination(db, resident_profile, property_row)
+    if payout_method not in {"upi", "bank"} or not payout_destination:
+        raise HTTPException(status_code=400, detail="Owner has not added payment details")
+
+    amount_paise = int(round(float(item.amount) * 100))
+    order_payload = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": str(item.id),
+        "notes": {
+            "payment_id": str(item.id),
+            "resident_id": str(item.resident_id),
+            "property_id": str(item.property_id),
+        },
+    }
+    order = _razorpay_request(
+        "POST",
+        "/orders",
+        settings.razorpay_key_id,
+        settings.razorpay_key_secret,
+        payload=order_payload,
+    )
+
+    return {
+        "key_id": settings.razorpay_key_id,
+        "order_id": order.get("id"),
+        "amount": amount_paise,
+        "currency": "INR",
+        "name": "Easy Stay",
+        "description": "Rent payment",
+        "payment_id": str(item.id),
+    }
+
+
+@router.post("/{payment_id}/razorpay/verify")
+def verify_razorpay_payment(
+    payment_id: UUID,
+    payload: RazorpayVerifyRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    settings = get_settings()
+    if not settings.razorpay_enabled or not settings.razorpay_key_id or not settings.razorpay_key_secret:
+        raise HTTPException(status_code=400, detail="Razorpay is not configured")
+
+    item = payments_repo.get(db, payment_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    ensure_property_access(db, user, str(item.property_id))
+    if get_role_name(user) == "resident" and str(item.resident_id) != str(user.id):
+        raise HTTPException(status_code=403, detail="Residents can only verify their own payments")
+
+    if not _verify_razorpay_signature(
+        payload.razorpay_order_id,
+        payload.razorpay_payment_id,
+        payload.razorpay_signature,
+        settings.razorpay_key_secret,
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Razorpay signature")
+
+    rzp_payment = _razorpay_request(
+        "GET",
+        f"/payments/{payload.razorpay_payment_id}",
+        settings.razorpay_key_id,
+        settings.razorpay_key_secret,
+    )
+    rzp_status = str(rzp_payment.get("status", "")).lower()
+    rzp_amount = int(rzp_payment.get("amount", 0) or 0)
+    rzp_order_id = str(rzp_payment.get("order_id", ""))
+
+    expected_amount = int(round(float(item.amount) * 100))
+    if rzp_order_id != payload.razorpay_order_id:
+        raise HTTPException(status_code=400, detail="Razorpay order mismatch")
+    if rzp_amount != expected_amount:
+        raise HTTPException(status_code=400, detail="Razorpay amount mismatch")
+    if rzp_status not in {"authorized", "captured"}:
+        raise HTTPException(status_code=400, detail="Razorpay payment not successful")
+
+    background_tasks = BackgroundTasks()
+    return update_payment(
+        payment_id=payment_id,
+        payload=PaymentUpdate(status="paid", gateway_channel="razorpay"),
+        background_tasks=background_tasks,
+        db=db,
+        current_user=user,
+    )
 
 
 @router.delete("/{payment_id}")
