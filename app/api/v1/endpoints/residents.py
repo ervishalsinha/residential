@@ -48,6 +48,28 @@ def _charge_lines_for_message(item: ResidentProfile) -> list[str]:
     return [f"{labels[key]} INR {value:,.2f}" for key, value in breakdown.items() if value > 0]
 
 
+def _format_profile_field_value(field: str, value):
+    if value is None:
+        return "Not set"
+    currency_fields = {
+        "monthly_rent",
+        "security_deposit",
+        "electricity_bill",
+        "maintenance_bill",
+        "parking_charges",
+        "wifi_charges",
+        "cleaning_bill",
+        "water_bill",
+    }
+    if field in currency_fields:
+        return f"INR {float(value):,.2f}"
+    if field in {"joining_date", "vacated_on"}:
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+    if field == "payment_due_day":
+        return f"{value}"
+    return str(value)
+
+
 def _normalize_joining_date(value: datetime | None):
     if value is None:
         return None
@@ -460,6 +482,21 @@ async def update_resident(resident_id: UUID, payload: ResidentUpdate, db: Sessio
         data["vacated_on"] = _normalize_vacated_on(payload.vacated_on)
 
     previous_unit_id = str(item.unit_id) if item.unit_id else None
+    previous_values = {
+        "unit_id": str(item.unit_id) if item.unit_id else None,
+        "monthly_rent": item.monthly_rent,
+        "security_deposit": item.security_deposit,
+        "electricity_bill": item.electricity_bill,
+        "maintenance_bill": item.maintenance_bill,
+        "parking_charges": item.parking_charges,
+        "wifi_charges": item.wifi_charges,
+        "cleaning_bill": item.cleaning_bill,
+        "water_bill": item.water_bill,
+        "payment_due_day": item.payment_due_day,
+        "joining_date": item.joining_date,
+        "vacated_on": item.vacated_on,
+        "aadhaar_image_url": item.aadhaar_image_url,
+    }
     updated = residents_repo.update(db, item, data)
     role_name = user.role.name if user.role else "resident"
 
@@ -483,11 +520,53 @@ async def update_resident(resident_id: UUID, payload: ResidentUpdate, db: Sessio
         await emit_event("notification.created", {"user_id": str(updated.user_id), "type": "room_transfer_update"})
 
     if data and role_name in {"property_admin", "super_admin"}:
+        changed_labels = {
+            "unit_id": "Room/Flat",
+            "monthly_rent": "Monthly Rent",
+            "security_deposit": "Security Deposit",
+            "electricity_bill": "Electricity Bill",
+            "maintenance_bill": "Maintenance Bill",
+            "parking_charges": "Parking Charges",
+            "wifi_charges": "WiFi Charges",
+            "cleaning_bill": "Cleaning Bill",
+            "water_bill": "Water Bill",
+            "payment_due_day": "Payment Due Day",
+            "joining_date": "Joining Date",
+            "vacated_on": "Vacated On",
+            "aadhaar_image_url": "Aadhaar Image",
+        }
+
+        relevant_changed_fields = [field for field in data.keys() if field in changed_labels]
+        unit_map: dict[str, str] = {}
+        unit_ids_to_load = {value for value in [previous_values.get("unit_id"), next_unit_id] if value}
+        if unit_ids_to_load:
+            loaded_units = db.query(Unit).filter(Unit.id.in_(unit_ids_to_load)).all()
+            unit_map = {str(value.id): value.unit_number for value in loaded_units}
+
+        change_lines: list[str] = []
+        for field in relevant_changed_fields:
+            old_value = previous_values.get(field)
+            new_value = getattr(updated, field, None)
+            if field == "unit_id":
+                old_display = unit_map.get(str(old_value), "Unassigned") if old_value else "Unassigned"
+                new_display = unit_map.get(str(new_value), "Unassigned") if new_value else "Unassigned"
+            else:
+                old_display = _format_profile_field_value(field, old_value)
+                new_display = _format_profile_field_value(field, new_value)
+            if old_display == new_display:
+                continue
+            change_lines.append(f"{changed_labels[field]}: {old_display} -> {new_display}")
+
+        body = "Your resident profile was updated by the owner."
+        if change_lines:
+            body += " Updated fields: " + "; ".join(change_lines) + "."
+
         profile_notification = Notification(
             user_id=str(updated.user_id),
             notification_type="resident_profile_updated",
             title="Profile updated",
-            body="Your resident details were updated by the owner.",
+            body=body,
+            metadata_json=json.dumps({"resident_id": str(updated.id), "changes": change_lines}),
             channel="push",
             status="queued",
             is_read=False,

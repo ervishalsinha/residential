@@ -346,6 +346,18 @@ def _owner_destination_display(method: str | None, destination: str | None) -> s
     return None
 
 
+def _load_proof_urls(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
 @router.get("")
 def list_payments(
     skip: int = 0,
@@ -487,6 +499,8 @@ def owner_rent_tracker(
                 "payment_id": str(payment.id),
                 "amount": float(payment.amount) if payment.amount is not None else _resident_total_due(resident),
                 "paid_at": payment.paid_at,
+                "manual_review_status": payment.manual_review_status,
+                "manual_payment_proof_urls": _load_proof_urls(payment.manual_payment_proof_urls_json),
                 "breakdown": _resident_charge_breakdown(resident),
             }
 
@@ -658,6 +672,7 @@ def tenant_due_breakdown(
             "owner_mobile": owner_mobile,
             "manual_payment_utr": item.manual_payment_utr,
             "manual_payment_proof_url": item.manual_payment_proof_url,
+            "manual_payment_proof_urls": _load_proof_urls(item.manual_payment_proof_urls_json),
             "manual_payment_submitted_at": item.manual_payment_submitted_at,
             "manual_review_status": item.manual_review_status,
             "manual_review_note": item.manual_review_note,
@@ -879,11 +894,12 @@ def update_payment(
     updated = payments_repo.update(db, item, data)
 
     if data.get("status") == "paid" and previous_status != "paid":
+        cycle_label = _month_label(int(updated.rent_year), int(updated.rent_month)) if updated.rent_year and updated.rent_month else (updated.due_date.strftime("%d %b %Y") if updated.due_date else "current cycle")
         resident_notification = Notification(
             user_id=str(updated.resident_id),
             notification_type="payment_status_update",
             title="Payment marked as paid",
-            body=f"Your {updated.payment_type} payment of INR {float(updated.amount):,.2f} is marked paid.",
+            body=f"Your {updated.payment_type} payment for {cycle_label} of INR {float(updated.amount):,.2f} is marked paid.",
             channel="push",
             status="queued",
             is_read=False,
@@ -899,6 +915,14 @@ def update_payment(
         else:
             resident_user = current_user
         resident_name = resident_user.full_name if resident_user and resident_user.full_name else "Resident"
+        resident_profile = (
+            db.query(ResidentProfile)
+            .filter(ResidentProfile.user_id == str(updated.resident_id), ResidentProfile.property_id == str(updated.property_id))
+            .order_by(ResidentProfile.updated_at.desc())
+            .first()
+        )
+        resident_unit = db.query(Unit).filter(Unit.id == str(resident_profile.unit_id)).first() if resident_profile and resident_profile.unit_id else None
+        resident_room = resident_unit.unit_number if resident_unit else "Unassigned"
 
         for owner_user_id in owner_user_ids:
             if owner_user_id == str(updated.resident_id):
@@ -908,7 +932,7 @@ def update_payment(
                     user_id=owner_user_id,
                     notification_type="resident_payment_received",
                     title="Payment received",
-                    body=f"{resident_name} paid INR {float(updated.amount):,.2f} for {updated.payment_type}.",
+                    body=f"{resident_name} ({resident_room}) paid INR {float(updated.amount):,.2f} for {updated.payment_type} [{cycle_label}].",
                     channel="push",
                     status="queued",
                     is_read=False,
@@ -964,8 +988,13 @@ def submit_direct_transfer_payment(
         raise HTTPException(status_code=400, detail="Owner has not added payment details")
 
     item.gateway_channel = "manual_direct_transfer"
-    item.manual_payment_utr = payload.utr_reference.strip()
-    item.manual_payment_proof_url = (payload.proof_image_url or "").strip() or None
+    clean_urls = [str(value).strip() for value in payload.proof_image_urls if str(value).strip()]
+    if not clean_urls:
+        raise HTTPException(status_code=400, detail="At least one proof image is required")
+
+    item.manual_payment_utr = None
+    item.manual_payment_proof_url = clean_urls[0]
+    item.manual_payment_proof_urls_json = json.dumps(clean_urls)
     item.manual_payment_submitted_at = datetime.utcnow()
     item.manual_review_status = "submitted"
     item.manual_review_note = None
@@ -975,6 +1004,11 @@ def submit_direct_transfer_payment(
     db.refresh(item)
 
     owner_user_ids = _property_owner_user_ids(db, str(item.property_id))
+    resident_user = db.query(User).filter(User.id == str(item.resident_id)).first()
+    resident_unit = db.query(Unit).filter(Unit.id == str(resident_profile.unit_id)).first() if resident_profile.unit_id else None
+    cycle_display = _month_label(int(item.rent_year), int(item.rent_month)) if item.rent_year and item.rent_month else (item.due_date.strftime("%d %b %Y") if item.due_date else "current cycle")
+    resident_name = resident_user.full_name if resident_user and resident_user.full_name else "Resident"
+    resident_room = resident_unit.unit_number if resident_unit else "Unassigned"
     for owner_user_id in owner_user_ids:
         if owner_user_id == str(item.resident_id):
             continue
@@ -983,8 +1017,8 @@ def submit_direct_transfer_payment(
                 user_id=owner_user_id,
                 notification_type="payment_proof_submitted",
                 title="Payment proof submitted",
-                body=f"Resident submitted transfer proof (UTR {item.manual_payment_utr}) for INR {float(item.amount):,.2f}.",
-                metadata_json=json.dumps({"payment_id": str(item.id)}),
+                body=f"{resident_name} ({resident_room}) submitted payment proof for {cycle_display} amount INR {float(item.amount):,.2f}.",
+                metadata_json=json.dumps({"payment_id": str(item.id), "resident_name": resident_name, "room": resident_room, "cycle": cycle_display}),
                 channel="push",
                 status="queued",
                 is_read=False,
@@ -1066,6 +1100,20 @@ def review_direct_transfer_payment(
             db=db,
             current_user=user,
         )
+        approved_cycle = _month_label(int(updated.rent_year), int(updated.rent_month)) if updated.rent_year and updated.rent_month else "this cycle"
+        db.add(
+            Notification(
+                user_id=str(updated.resident_id),
+                notification_type="payment_proof_approved",
+                title="Payment proof approved",
+                body=f"Your payment proof for {approved_cycle} (INR {float(updated.amount):,.2f}) has been approved and the cycle is marked paid.",
+                metadata_json=json.dumps({"payment_id": str(updated.id), "cycle": approved_cycle}),
+                channel="push",
+                status="queued",
+                is_read=False,
+            )
+        )
+        db.commit()
         return {
             "message": "Payment proof approved and cycle marked as paid",
             "payment_id": str(updated.id),
@@ -1080,13 +1128,18 @@ def review_direct_transfer_payment(
     db.commit()
     db.refresh(item)
 
+    rejected_cycle = _month_label(int(item.rent_year), int(item.rent_month)) if item.rent_year and item.rent_month else "this cycle"
     db.add(
         Notification(
             user_id=str(item.resident_id),
             notification_type="payment_proof_rejected",
             title="Payment proof rejected",
-            body="Owner rejected your payment proof. Please submit a valid UTR/screenshot.",
-            metadata_json=json.dumps({"payment_id": str(item.id), "note": item.manual_review_note}),
+            body=(
+                f"Your payment proof for {rejected_cycle} (INR {float(item.amount):,.2f}) was rejected. "
+                + (f"Owner note: {item.manual_review_note}. " if item.manual_review_note else "")
+                + "Please submit valid screenshots again."
+            ),
+            metadata_json=json.dumps({"payment_id": str(item.id), "note": item.manual_review_note, "cycle": rejected_cycle}),
             channel="push",
             status="queued",
             is_read=False,

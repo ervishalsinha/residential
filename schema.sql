@@ -114,6 +114,7 @@ CREATE TABLE payments (
   transfer_updated_at TIMESTAMP,
   manual_payment_utr VARCHAR(80),
   manual_payment_proof_url VARCHAR(500),
+  manual_payment_proof_urls_json VARCHAR(5000),
   manual_payment_submitted_at TIMESTAMP,
   manual_review_status VARCHAR(30),
   manual_review_note VARCHAR(500),

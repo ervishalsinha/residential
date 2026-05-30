@@ -162,13 +162,23 @@ def create_complaint(
         target_user_ids = resident_user_ids.union(owner_user_ids).union({str(user.id)})
         visibility_label = "owner + all tenants"
 
+    resident_user = db.query(User).filter(User.id == str(item.resident_id)).first()
+    resident_name = resident_user.full_name if resident_user and resident_user.full_name else "Resident"
+    resident_profile = db.query(ResidentProfile).filter(ResidentProfile.user_id == str(item.resident_id), ResidentProfile.property_id == str(item.property_id)).first()
+    resident_unit = db.query(Unit).filter(Unit.id == str(resident_profile.unit_id)).first() if resident_profile and resident_profile.unit_id else None
+    resident_unit_label = resident_unit.unit_number if resident_unit else "Unassigned"
+
     for target_user_id in target_user_ids:
         db.add(
             Notification(
                 user_id=target_user_id,
                 notification_type="complaint_raised",
                 title="New complaint raised",
-                body=f"{item.title} ({item.priority}) has been raised in your stay ({visibility_label}).",
+                body=(
+                    f"{resident_name} ({resident_unit_label}) raised complaint '{item.title}' "
+                    f"[{item.category}/{item.priority}] with visibility {visibility_label}."
+                ),
+                metadata_json=json.dumps({"complaint_id": str(item.id), "resident_name": resident_name, "unit": resident_unit_label}),
                 channel="push",
                 status="queued",
                 is_read=False,

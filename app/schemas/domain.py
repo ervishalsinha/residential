@@ -163,8 +163,7 @@ class RazorpayVerifyRequest(BaseModel):
 
 
 class DirectTransferSubmitRequest(BaseModel):
-    utr_reference: str
-    proof_image_url: str | None = None
+    proof_image_urls: list[str]
 
 
 class DirectTransferProofUploadRequest(BaseModel):

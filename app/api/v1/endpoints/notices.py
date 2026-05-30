@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.deps import ensure_property_access, get_current_user, get_role_name, owned_property_ids, resident_property_ids
 from app.core.socket_server import emit_event
 from app.db.session import get_db
-from app.models import Notice, Notification, OwnerExpense, ResidentProfile, User
+from app.models import Notice, Notification, OwnerExpense, Property, ResidentProfile, User
 from app.repositories.domain import notices_repo
 from app.schemas.domain import NoticeCreate, NoticeUpdate
 
@@ -108,13 +108,20 @@ def create_notice(
     target_user_ids = resident_user_ids.union(owner_user_ids)
     target_user_ids.add(str(user.id))
 
+    property_row = db.query(Property).filter(Property.id == property_id).first()
+    property_name = property_row.name if property_row else "your property"
+    publisher_name = user.full_name if user and user.full_name else "Owner"
+    content_preview = (item.content or "").strip().replace("\n", " ")[:90]
+    content_suffix = f" Details: {content_preview}." if content_preview else ""
+
     for target_user_id in target_user_ids:
         db.add(
             Notification(
                 user_id=target_user_id,
                 notification_type="notice_published",
                 title="New notice published",
-                body=f"{item.title} has been posted for your stay.",
+                body=f"{item.title} has been posted for {property_name} by {publisher_name}.{content_suffix}",
+                metadata_json=json.dumps({"notice_id": str(item.id), "property_name": property_name, "publisher_name": publisher_name}),
                 channel="push",
                 status="queued",
                 is_read=False,
