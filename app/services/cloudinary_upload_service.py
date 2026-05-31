@@ -30,6 +30,14 @@ def _configure_cloudinary() -> None:
         return
 
     settings = get_settings()
+    if settings.cloudinary_url:
+        cloudinary.config(
+            cloudinary_url=settings.cloudinary_url,
+            secure=True,
+        )
+        _cloudinary_configured = True
+        return
+
     if not settings.cloudinary_cloud_name or not settings.cloudinary_api_key or not settings.cloudinary_api_secret:
         raise ImageUploadError("Cloudinary is not configured on the server")
 
