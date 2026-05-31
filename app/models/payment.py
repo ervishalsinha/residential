@@ -39,6 +39,7 @@ class Payment(Base):
     manual_payment_proof_urls_json: Mapped[str | None] = mapped_column(String(5000), nullable=True)
     manual_payment_submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     manual_review_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    manual_partial_amount: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
     manual_review_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
     manual_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     manual_reviewed_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)

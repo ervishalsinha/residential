@@ -50,7 +50,17 @@ class PaymentRoutingValidationTests(unittest.TestCase):
         self.client.close()
         app.dependency_overrides.clear()
 
-    def _seed(self, *, owner_active_method: str | None, owner_upi: str | None, owner_account: str | None, owner_ifsc: str | None):
+    def _seed(
+        self,
+        *,
+        owner_active_method: str | None,
+        owner_upi: str | None,
+        owner_upi_name: str | None,
+        owner_bank_name: str | None,
+        owner_bank_account_name: str | None,
+        owner_account: str | None,
+        owner_ifsc: str | None,
+    ):
         db = TestingSessionLocal()
         try:
             role_owner = Role(id=str(uuid.uuid4()), name="property_admin")
@@ -65,6 +75,9 @@ class PaymentRoutingValidationTests(unittest.TestCase):
                 password_hash="hashed",
                 role_id=role_owner.id,
                 payment_upi_id=owner_upi,
+                payment_upi_account_holder_name=owner_upi_name,
+                payment_bank_name=owner_bank_name,
+                payment_bank_account_holder_name=owner_bank_account_name,
                 payment_bank_account_number=owner_account,
                 payment_bank_ifsc=owner_ifsc,
                 active_payment_method=owner_active_method,
@@ -124,7 +137,15 @@ class PaymentRoutingValidationTests(unittest.TestCase):
             db.close()
 
     def test_active_method_validation_requires_upi_details(self):
-        seeded = self._seed(owner_active_method="upi", owner_upi="owner@upi", owner_account=None, owner_ifsc=None)
+        seeded = self._seed(
+            owner_active_method="upi",
+            owner_upi="owner@upi",
+            owner_upi_name="Owner One",
+            owner_bank_name=None,
+            owner_bank_account_name=None,
+            owner_account=None,
+            owner_ifsc=None,
+        )
 
         def _owner_user_override(db: Session = Depends(get_db)):
             return db.query(User).filter(User.id == seeded["owner_id"]).first()
@@ -140,12 +161,15 @@ class PaymentRoutingValidationTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("UPI ID is required", response.json().get("detail", ""))
+        self.assertIn("UPI ID and account holder name are required", response.json().get("detail", ""))
 
     def test_resident_payment_blocked_when_owner_settings_incomplete(self):
         seeded = self._seed(
             owner_active_method="bank",
             owner_upi=None,
+            owner_upi_name=None,
+            owner_bank_name="HDFC Bank",
+            owner_bank_account_name="Owner One",
             owner_account="123456789012",
             owner_ifsc=None,
         )
@@ -160,8 +184,8 @@ class PaymentRoutingValidationTests(unittest.TestCase):
             json={"status": "paid", "gateway_channel": "upi"},
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("Owner payment destination is not configured", response.json().get("detail", ""))
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Residents cannot directly update payment status", response.json().get("detail", ""))
 
 
 if __name__ == "__main__":

@@ -50,8 +50,6 @@ def _summary(db: Session, property_id: UUID | None = None):
         "due_payments": due_payments,
         "active_emergencies": active_emergencies,
         "recent_notices": recent_notices,
-        "route_linked_account_badge": "missing",
-        "route_linked_account_status": None,
     }
 
 
@@ -62,33 +60,27 @@ def dashboard_public_summary(property_id: UUID | None = None, db: Session = Depe
 
 @router.get("/summary")
 def dashboard_summary(property_id: UUID | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    linked_account_status = (user.razorpay_linked_account_status or "").strip().lower() or None
-    route_linked_account_badge = "verified" if (user.razorpay_linked_account_id and linked_account_status in {"activated", "verified"}) else "missing"
-
-    def with_owner_badge(payload: dict) -> dict:
-        result = dict(payload)
-        result["route_linked_account_badge"] = route_linked_account_badge
-        result["route_linked_account_status"] = user.razorpay_linked_account_status
-        return result
+    def owner_view(payload: dict) -> dict:
+        return dict(payload)
 
     if property_id:
         ensure_property_access(db, user, str(property_id))
-        return with_owner_badge(_summary(db, property_id))
+        return owner_view(_summary(db, property_id))
 
     role_name = get_role_name(user)
     if role_name == "super_admin":
-        return with_owner_badge(_summary(db, None))
+        return owner_view(_summary(db, None))
 
     if role_name == "property_admin":
         owned_ids = owned_property_ids(db, user)
         if not owned_ids:
-            return with_owner_badge({"open_complaints": 0, "pending_visitors": 0, "due_payments": 0, "active_emergencies": 0, "recent_notices": 0})
+            return owner_view({"open_complaints": 0, "pending_visitors": 0, "due_payments": 0, "active_emergencies": 0, "recent_notices": 0})
         aggregate = {"open_complaints": 0, "pending_visitors": 0, "due_payments": 0, "active_emergencies": 0, "recent_notices": 0}
         for item in owned_ids:
             result = _summary(db, UUID(item))
             for key in aggregate:
                 aggregate[key] += int(result[key])
-        return with_owner_badge(aggregate)
+        return owner_view(aggregate)
 
     resident_ids = resident_property_ids(db, user)
     if not resident_ids:

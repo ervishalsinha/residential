@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class PropertyCreate(BaseModel):
@@ -156,14 +156,9 @@ class PaymentUpdate(BaseModel):
     gateway_channel: str | None = None
 
 
-class RazorpayVerifyRequest(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
-
-
 class DirectTransferSubmitRequest(BaseModel):
-    proof_image_urls: list[str]
+    utr_number: str
+    proof_image_urls: list[str] = Field(default_factory=list)
 
 
 class DirectTransferProofUploadRequest(BaseModel):
@@ -173,6 +168,7 @@ class DirectTransferProofUploadRequest(BaseModel):
 
 class DirectTransferReviewRequest(BaseModel):
     decision: str
+    partial_amount: float | None = None
     note: str | None = None
 
 
