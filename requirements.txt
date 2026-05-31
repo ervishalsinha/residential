@@ -12,3 +12,4 @@ python-multipart==0.0.20
 slowapi==0.1.9
 python-socketio==5.12.1
 firebase-admin==7.1.0
+cloudinary==1.44.1

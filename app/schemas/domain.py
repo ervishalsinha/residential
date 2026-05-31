@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -164,6 +165,12 @@ class DirectTransferSubmitRequest(BaseModel):
 class DirectTransferProofUploadRequest(BaseModel):
     image_base64: str
     mime_type: str | None = None
+
+
+class ImageUploadRequest(BaseModel):
+    image_base64: str
+    mime_type: str | None = None
+    upload_type: Literal["profiles", "properties", "complaints", "notices", "rent-proofs"] = "rent-proofs"
 
 
 class DirectTransferReviewRequest(BaseModel):

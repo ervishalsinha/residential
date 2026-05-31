@@ -14,6 +14,7 @@ from app.api.v1.endpoints import (
 	properties,
 	residents,
 	staff,
+	uploads,
 	units,
 	visitors,
 )
@@ -30,6 +31,7 @@ api_router.include_router(visitors.router, prefix="/visitors", tags=["visitors"]
 api_router.include_router(notices.router, prefix="/notices", tags=["notices"])
 api_router.include_router(payments.router, prefix="/payments", tags=["payments"])
 api_router.include_router(expenses.router, prefix="/expenses", tags=["expenses"])
+api_router.include_router(uploads.router, prefix="/uploads", tags=["uploads"])
 api_router.include_router(staff.router, prefix="/staff", tags=["staff"])
 api_router.include_router(units.router, prefix="/units", tags=["units"])
 api_router.include_router(emergency.router, prefix="/emergency", tags=["emergency"])

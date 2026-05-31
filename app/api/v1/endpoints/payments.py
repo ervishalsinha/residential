@@ -1,13 +1,9 @@
 import json
-import base64
-import binascii
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
-from uuid import uuid4
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import case, extract, func
 from sqlalchemy.orm import Session
 
@@ -23,10 +19,9 @@ from app.schemas.domain import (
     PaymentCreate,
     PaymentUpdate,
 )
+from app.services.cloudinary_upload_service import ImageUploadError, upload_image_base64
 
 router = APIRouter()
-proof_upload_dir = Path(__file__).resolve().parents[4] / "uploads" / "payment-proofs"
-proof_upload_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _resident_charge_breakdown(resident: ResidentProfile) -> dict[str, float]:
@@ -1021,37 +1016,22 @@ def submit_direct_transfer_payment(
 @router.post("/direct-transfer/proofs/upload")
 def upload_direct_transfer_proof(
     payload: DirectTransferProofUploadRequest,
-    request: Request,
     user: User = Depends(get_current_user),
 ):
     del user
-    raw_base64 = (payload.image_base64 or "").strip()
-    if not raw_base64:
-        raise HTTPException(status_code=400, detail="image_base64 is required")
-
-    if "," in raw_base64 and raw_base64.lower().startswith("data:"):
-        raw_base64 = raw_base64.split(",", 1)[1]
-
     try:
-        image_bytes = base64.b64decode(raw_base64, validate=True)
-    except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid base64 image payload")
+        proof_url = upload_image_base64(
+            image_base64=payload.image_base64,
+            mime_type=payload.mime_type,
+            upload_type="rent-proofs",
+        )
+    except ImageUploadError as exc:
+        detail = str(exc)
+        status_code = 400
+        if detail in {"Cloudinary is not configured on the server", "Failed to upload image", "Cloudinary did not return a secure URL"}:
+            status_code = 502
+        raise HTTPException(status_code=status_code, detail=detail)
 
-    if len(image_bytes) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Image too large. Max 5MB allowed")
-
-    mime_type = (payload.mime_type or "image/jpeg").strip().lower()
-    extension = ".jpg"
-    if mime_type in {"image/png", "png"}:
-        extension = ".png"
-    elif mime_type in {"image/webp", "webp"}:
-        extension = ".webp"
-
-    file_name = f"proof_{uuid4().hex}{extension}"
-    file_path = proof_upload_dir / file_name
-    file_path.write_bytes(image_bytes)
-
-    proof_url = str(request.base_url).rstrip("/") + f"/uploads/payment-proofs/{file_name}"
     return {"proof_image_url": proof_url}
 
 

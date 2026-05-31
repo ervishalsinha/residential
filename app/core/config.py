@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     razorpay_key_secret: str | None = None
     razorpay_webhook_secret: str | None = None
 
+    cloudinary_cloud_name: str | None = None
+    cloudinary_api_key: str | None = None
+    cloudinary_api_secret: str | None = None
+    cloudinary_base_folder: str = "residential-os"
+    image_upload_max_bytes: int = 5 * 1024 * 1024
+
     cors_origins: str = "*"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
