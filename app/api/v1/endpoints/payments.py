@@ -463,6 +463,7 @@ def owner_rent_tracker(
                 "amount": float(payment.amount) if payment.amount is not None else _resident_total_due(resident),
                 "paid_at": payment.paid_at,
                 "manual_review_status": payment.manual_review_status,
+                "manual_review_note": payment.manual_review_note,
                 "manual_payment_proof_urls": _load_proof_urls(payment.manual_payment_proof_urls_json),
                 "breakdown": _resident_charge_breakdown(resident),
             }
@@ -1073,6 +1074,9 @@ def review_direct_transfer_payment(
     if item.manual_review_status != "submitted":
         raise HTTPException(status_code=400, detail="No pending transfer proof to review")
 
+    if decision == "reject" and not (payload.note or "").strip():
+        raise HTTPException(status_code=400, detail="Reject reason is required")
+
     item.manual_reviewed_by = str(user.id)
     item.manual_reviewed_at = datetime.utcnow()
     item.manual_review_note = (payload.note or "").strip() or None
@@ -1106,8 +1110,9 @@ def review_direct_transfer_payment(
         return {
             "message": "Payment proof approved and cycle marked as paid",
             "payment_id": str(updated.id),
-            "status": str(updated.status),
+            "status": updated.status.value if hasattr(updated.status, "value") else str(updated.status),
             "manual_review_status": "approved",
+            "manual_review_note": item.manual_review_note,
             "verification_status": _verification_status(updated),
         }
 
@@ -1151,8 +1156,9 @@ def review_direct_transfer_payment(
         return {
             "message": "Payment marked as partial",
             "payment_id": str(item.id),
-            "status": str(item.status),
+            "status": item.status.value if hasattr(item.status, "value") else str(item.status),
             "manual_review_status": item.manual_review_status,
+            "manual_review_note": item.manual_review_note,
             "verification_status": _verification_status(item),
         }
 
@@ -1185,8 +1191,9 @@ def review_direct_transfer_payment(
     return {
         "message": "Payment proof rejected",
         "payment_id": str(item.id),
-        "status": str(item.status),
+        "status": item.status.value if hasattr(item.status, "value") else str(item.status),
         "manual_review_status": item.manual_review_status,
+        "manual_review_note": item.manual_review_note,
         "verification_status": _verification_status(item),
     }
 
