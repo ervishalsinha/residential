@@ -1,8 +1,10 @@
 from logging.config import fileConfig
+import os
 
 from alembic import context
 from sqlalchemy import create_engine
 
+from app.core.config import get_settings
 from app.models import Base
 
 config = context.config
@@ -12,13 +14,20 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def _resolve_database_url() -> str:
+    direct = os.getenv("DATABASE_URL")
+    if direct:
+        return direct
+
+    settings_url = get_settings().database_url
+    if settings_url:
+        return settings_url
+
+    raise Exception("DATABASE_URL not set")
+
+
 def run_migrations_offline() -> None:
-    import os
-
-    database_url = os.getenv("DATABASE_URL")
-
-    if not database_url:
-        raise Exception("DATABASE_URL not set")
+    database_url = _resolve_database_url()
 
     context.configure(
         url=database_url,
@@ -32,12 +41,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    import os
-
-    database_url = os.getenv("DATABASE_URL")
-
-    if not database_url:
-        raise Exception("DATABASE_URL not set")
+    database_url = _resolve_database_url()
 
     connectable = create_engine(database_url, pool_pre_ping=True)
 

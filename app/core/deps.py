@@ -50,8 +50,21 @@ def get_role_name(user: User) -> str:
     return user.role.name if user.role else ""
 
 
-def owned_property_ids(db: Session, user: User) -> set[str]:
-    return {str(item[0]) for item in db.query(Property.id).filter(Property.owner_user_id == str(user.id)).all()}
+def owned_property_ids(db: Session, user: User, include_all: bool = False) -> set[str]:
+    owned_ids = {str(item[0]) for item in db.query(Property.id).filter(Property.owner_user_id == str(user.id)).all()}
+    if include_all:
+        return owned_ids
+    selected_id = str(user.selected_property_id) if user.selected_property_id else None
+    if selected_id and selected_id in owned_ids:
+        return {selected_id}
+    primary_row = (
+        db.query(Property.id)
+        .filter(Property.owner_user_id == str(user.id), Property.is_primary.is_(True))
+        .first()
+    )
+    if primary_row:
+        return {str(primary_row[0])}
+    return owned_ids
 
 
 def resident_property_ids(db: Session, user: User) -> set[str]:

@@ -50,6 +50,7 @@ class AuthenticatedUser(BaseModel):
     full_name: str
     mobile_number: str
     role: str
+    selected_property_id: str | None = None
     payment_upi_id: str | None = None
     payment_upi_account_holder_name: str | None = None
     payment_bank_account_holder_name: str | None = None

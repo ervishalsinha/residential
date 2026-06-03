@@ -7,16 +7,18 @@ from pydantic import BaseModel, Field
 
 class PropertyCreate(BaseModel):
     name: str
-    property_type_id: UUID
-    address_line1: str
-    city: str
-    state: str
-    pincode: str
+    property_type_id: UUID | None = None
+    property_type: str | None = None
+    address_line1: str = ""
+    city: str = ""
+    state: str = ""
+    pincode: str = ""
     total_units: int = 0
 
 
 class PropertyUpdate(BaseModel):
     name: str | None = None
+    property_type: str | None = None
     address_line1: str | None = None
     city: str | None = None
     state: str | None = None

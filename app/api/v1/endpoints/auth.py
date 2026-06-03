@@ -245,6 +245,7 @@ def me(user: User = Depends(get_current_user)) -> AuthenticatedUser:
         full_name=user.full_name,
         mobile_number=user.mobile_number,
         role=role_name,
+        selected_property_id=str(user.selected_property_id) if user.selected_property_id else None,
         payment_upi_id=user.payment_upi_id,
         payment_upi_account_holder_name=user.payment_upi_account_holder_name,
         payment_bank_account_holder_name=user.payment_bank_account_holder_name,
