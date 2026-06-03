@@ -3,13 +3,32 @@ from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.deps import ensure_property_access, get_current_user, get_role_name, owned_property_ids
 from app.core.security import hash_password
 from app.core.socket_server import emit_event
 from app.db.session import get_db
-from app.models import AuthSession, Notification, Payment, Property, PropertyType, ResidentProfile, Role, Unit, User
+from app.models import (
+    AuthSession,
+    Complaint,
+    ComplaintComment,
+    EmergencyAlert,
+    Notification,
+    Notice,
+    OwnerExpense,
+    Payment,
+    PaymentHistory,
+    Property,
+    PropertyType,
+    ResidentProfile,
+    Role,
+    Unit,
+    User,
+    Visitor,
+    VisitorLog,
+)
 from app.repositories.domain import residents_repo
 from app.schemas.domain import ManagedTenantCreate, ResidentCreate, ResidentUpdate
 from app.services.notification_service import send_push_notification
@@ -641,6 +660,57 @@ def delete_resident(resident_id: UUID, db: Session = Depends(get_db), user: User
     )
     db.commit()
     return {"message": "Tenant removed and user login blocked"}
+
+
+@router.delete("/{resident_id}/permanent")
+def delete_resident_permanently(resident_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    item = residents_repo.get(db, resident_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Resident not found")
+    ensure_property_access(db, user, str(item.property_id), owner_only=True)
+
+    normalized_status = (item.occupancy_status or "").strip().lower()
+    if normalized_status not in {"vacated", "deleted"}:
+        raise HTTPException(status_code=400, detail="Only vacated/deleted tenants can be removed permanently")
+
+    resident_user_id = str(item.user_id)
+
+    try:
+        payment_ids = [value[0] for value in db.query(Payment.id).filter(Payment.resident_id == resident_user_id).all()]
+        if payment_ids:
+            db.query(PaymentHistory).filter(PaymentHistory.payment_id.in_(payment_ids)).delete(synchronize_session=False)
+            db.query(Payment).filter(Payment.id.in_(payment_ids)).delete(synchronize_session=False)
+
+        visitor_ids = [value[0] for value in db.query(Visitor.id).filter(Visitor.resident_id == resident_user_id).all()]
+        if visitor_ids:
+            db.query(VisitorLog).filter(VisitorLog.visitor_id.in_(visitor_ids)).delete(synchronize_session=False)
+            db.query(Visitor).filter(Visitor.id.in_(visitor_ids)).delete(synchronize_session=False)
+
+        complaint_ids = [value[0] for value in db.query(Complaint.id).filter(Complaint.resident_id == resident_user_id).all()]
+        if complaint_ids:
+            db.query(ComplaintComment).filter(ComplaintComment.complaint_id.in_(complaint_ids)).delete(synchronize_session=False)
+            db.query(Complaint).filter(Complaint.id.in_(complaint_ids)).delete(synchronize_session=False)
+
+        db.query(ComplaintComment).filter(ComplaintComment.author_user_id == resident_user_id).delete(synchronize_session=False)
+        db.query(EmergencyAlert).filter(EmergencyAlert.raised_by == resident_user_id).delete(synchronize_session=False)
+        db.query(Notice).filter(Notice.published_by == resident_user_id).delete(synchronize_session=False)
+        db.query(OwnerExpense).filter(OwnerExpense.created_by == resident_user_id).delete(synchronize_session=False)
+        db.query(Notification).filter(Notification.user_id == resident_user_id).delete(synchronize_session=False)
+        db.query(AuthSession).filter(AuthSession.user_id == resident_user_id).delete(synchronize_session=False)
+
+        db.query(Payment).filter(Payment.manual_reviewed_by == resident_user_id).update(
+            {"manual_reviewed_by": None},
+            synchronize_session=False,
+        )
+
+        db.query(ResidentProfile).filter(ResidentProfile.id == str(resident_id)).delete(synchronize_session=False)
+        db.query(User).filter(User.id == resident_user_id).delete(synchronize_session=False)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Could not permanently delete tenant: {exc}") from exc
+
+    return {"message": "Tenant and related records removed permanently"}
 
 
 @router.post("/{resident_id}/send-payment-reminder")
