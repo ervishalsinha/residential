@@ -473,7 +473,9 @@ async def update_resident(resident_id: UUID, payload: ResidentUpdate, db: Sessio
         raise HTTPException(status_code=404, detail="Resident not found")
     ensure_property_access(db, user, str(item.property_id), owner_only=True)
 
-    data = payload.model_dump(exclude_none=True)
+    # Keep explicitly provided nulls (for example unit_id=None when removing assignment)
+    # while ignoring fields not sent by the client.
+    data = payload.model_dump(exclude_unset=True)
     if "payment_due_day" in data:
         _validate_due_day(data["payment_due_day"])
     if "joining_date" in data:
