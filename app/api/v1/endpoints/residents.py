@@ -772,7 +772,7 @@ async def send_payment_reminder(
 
 
 
-    @router.get("/unit/{unit_id}/roommates")
+@router.get("/unit/{unit_id}/roommates")
 def get_unit_roommates(
     unit_id: UUID,
     db: Session = Depends(get_db),
