@@ -771,25 +771,34 @@ async def send_payment_reminder(
     return {"message": "Payment reminder sent", "notification_id": str(notification.id), "push": push}
 
 
-
-@router.get("/unit/{unit_id}/roommates")
+@router.get("/property/{property_id}/room/{unit_number}/roommates")
 def get_unit_roommates(
-    unit_id: UUID,
+    property_id: UUID,
+    unit_number: str,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    unit = db.query(Unit).filter(Unit.id == str(unit_id)).first()
+    ensure_property_access(db, user, str(property_id))
+
+    unit = (
+        db.query(Unit)
+        .filter(
+            Unit.property_id == str(property_id),
+            Unit.unit_number == unit_number,
+        )
+        .first()
+    )
 
     if not unit:
-        raise HTTPException(status_code=404, detail="Unit not found")
-
-    property_id = str(unit.property_id)
-    ensure_property_access(db, user, property_id)
+        raise HTTPException(
+            status_code=404,
+            detail="Room not found"
+        )
 
     residents = (
         db.query(ResidentProfile)
         .filter(
-            ResidentProfile.unit_id == str(unit_id),
+            ResidentProfile.unit_id == str(unit.id),
             ResidentProfile.occupancy_status == "active",
         )
         .all()
@@ -808,7 +817,7 @@ def get_unit_roommates(
     property_row = (
         db.query(PropertyType.name)
         .join(Property, Property.property_type_id == PropertyType.id)
-        .filter(Property.id == property_id)
+        .filter(Property.id == str(property_id))
         .first()
     )
 
@@ -823,11 +832,69 @@ def get_unit_roommates(
             {
                 "resident_id": str(r.id),
                 "user_id": str(r.user_id),
-                "full_name": user_map.get(str(r.user_id)).full_name if user_map.get(str(r.user_id)) else None,
-                "mobile_number": user_map.get(str(r.user_id)).mobile_number if user_map.get(str(r.user_id)) else None,
+                "full_name": user_map.get(str(r.user_id)).full_name
+                if user_map.get(str(r.user_id))
+                else None,
+                "mobile_number": user_map.get(str(r.user_id)).mobile_number
+                if user_map.get(str(r.user_id))
+                else None,
                 "occupancy_status": r.occupancy_status,
                 "joining_date": r.joining_date,
             }
             for r in residents
         ],
     }
+
+
+        @router.get("/unit/{unit_id}/roommates")
+        def get_unit_roommates_by_id(
+            unit_id: UUID,
+            db: Session = Depends(get_db),
+            user: User = Depends(get_current_user),
+        ):
+            unit = db.query(Unit).filter(Unit.id == str(unit_id)).first()
+            if not unit:
+                raise HTTPException(status_code=404, detail="Unit not found")
+
+            ensure_property_access(db, user, str(unit.property_id))
+
+            residents = (
+                db.query(ResidentProfile)
+                .filter(
+                    ResidentProfile.unit_id == str(unit.id),
+                    ResidentProfile.occupancy_status == "active",
+                )
+                .all()
+            )
+
+            user_ids = [str(r.user_id) for r in residents]
+
+            users = db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else []
+            user_map = {str(u.id): u for u in users}
+
+            property_row = (
+                db.query(PropertyType.name)
+                .join(Property, Property.property_type_id == PropertyType.id)
+                .filter(Property.id == str(unit.property_id))
+                .first()
+            )
+
+            stay_type = property_row[0] if property_row else None
+
+            return {
+                "unit_id": str(unit.id),
+                "unit_name": unit.unit_number,
+                "occupancy": len(residents),
+                "stay_type": stay_type,
+                "residents": [
+                    {
+                        "resident_id": str(r.id),
+                        "user_id": str(r.user_id),
+                        "full_name": user_map.get(str(r.user_id)).full_name if user_map.get(str(r.user_id)) else None,
+                        "mobile_number": user_map.get(str(r.user_id)).mobile_number if user_map.get(str(r.user_id)) else None,
+                        "occupancy_status": r.occupancy_status,
+                        "joining_date": r.joining_date,
+                    }
+                    for r in residents
+                ],
+            }
